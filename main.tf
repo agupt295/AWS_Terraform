@@ -338,3 +338,172 @@ resource "aws_security_group" "any" {
     ipv6_cidr_blocks = ["::/0"]
   }
 }
+
+# Create VPC endpoints
+resource "aws_vpc_endpoint" "interface" {
+  for_each = toset(["ssm", "ssmmessages", "ec2messages", "secretsmanager"])
+
+  vpc_id              = aws_vpc.default.id
+  service_name        = "com.amazonaws.${data.aws_region.current.name}.${each.key}"
+  vpc_endpoint_type   = "Interface"
+  private_dns_enabled = true
+
+  subnet_ids         = values(aws_subnet.private_ingress)[*].id
+  security_group_ids = [aws_security_group.any.id]
+
+  tags = {
+    Name = "${var.namespace}-endpoint-${each.key}"
+  }
+}
+
+resource "aws_vpc_endpoint" "gateway" {
+  for_each = toset(["s3"])
+
+  vpc_id       = aws_vpc.default.id
+  service_name = "com.amazonaws.${data.aws_region.current.name}.${each.key}"
+
+  tags = {
+    Name = "${var.namespace}-endpoint-${each.key}"
+  }
+}
+
+# RDS
+resource "aws_db_subnet_group" "mission_db_group" {
+  name       = "${var.namespace}-db-group"
+  subnet_ids = values(aws_subnet.private)[*].id
+
+  tags = {
+    Name = "${var.namespace}-db-group"
+  }
+}
+
+resource "random_password" "default" {
+  length           = 25
+  special          = false
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+resource "aws_secretsmanager_secret" "db" {
+  name_prefix             = "${var.namespace}-secret-db-"
+  description             = "Password to the RDS"
+  recovery_window_in_days = 7
+}
+
+resource "aws_secretsmanager_secret_version" "db" {
+  secret_id     = aws_secretsmanager_secret.db.id
+  secret_string = random_password.default.result
+}
+
+resource "aws_db_instance" "wp_mysql" {
+  identifier = "${var.namespace}-db"
+
+  allocated_storage      = 20
+  engine                 = local.rds.engine
+  engine_version         = local.rds.engine_version
+  instance_class         = local.rds.instance_class
+  db_name                = local.rds.db_name
+  username               = local.rds.username
+  password               = aws_secretsmanager_secret_version.db.secret_string
+  db_subnet_group_name   = aws_db_subnet_group.mission_db_group.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+  multi_az               = true
+  skip_final_snapshot    = true
+
+  tags = {
+    Name = "${var.namespace}-db"
+  }
+}
+
+# EFS
+resource "aws_efs_file_system" "mission_app" {
+  creation_token = "${var.namespace}-efs"
+  encrypted      = true
+
+  tags = {
+    Name = "${var.namespace}-efs"
+  }
+}
+
+resource "aws_efs_mount_target" "mission_app_targets" {
+  count = length(local.vpc.azs)
+
+  file_system_id  = aws_efs_file_system.mission_app.id
+  subnet_id       = aws_subnet.private_ingress[count.index].id
+  security_groups = [aws_security_group.nfs.id]
+}
+
+resource "aws_instance" "staging_app" {
+
+  lifecycle {
+    prevent_destroy = false
+    ignore_changes  = [iam_instance_profile, tags, tags_all]
+  }
+
+  ami                         = data.aws_ami.linux.image_id
+  instance_type               = local.vm.instance_type
+  subnet_id                   = aws_subnet.private_ingress[0].id
+  user_data_replace_on_change = true
+
+  user_data = templatefile("${path.module}/userdata/staging-efs.sh", {
+    region        = data.aws_region.current.name,
+    efs_id        = aws_efs_file_system.mission_app.id
+    db_name       = aws_db_instance.wp_mysql.db_name
+    db_username   = aws_db_instance.wp_mysql.username
+    db_password   = aws_db_instance.wp_mysql.password
+    db_host       = aws_db_instance.wp_mysql.address
+    DOMAIN_NAME   = aws_cloudfront_distribution.mission_app.domain_name
+    demo_username = local.demo.admin.username
+    demo_password = local.demo.admin.password
+    demo_email    = local.demo.admin.email
+  })
+
+  iam_instance_profile   = aws_iam_instance_profile.app.name
+  availability_zone      = data.aws_availability_zones.available.names[0]
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_put_response_hop_limit = 1
+    http_tokens                 = "required"
+    instance_metadata_tags      = "enabled"
+  }
+
+  root_block_device {
+    delete_on_termination = true
+    encrypted             = true
+  }
+
+  tags = {
+    Name = format("${var.namespace}-staging_app-%s", element(data.aws_availability_zones.available.names, 0))
+  }
+
+  depends_on = [aws_s3_object.mission_app-private_key, aws_s3_object.mission_app-public_key]
+}
+
+resource "aws_ami_copy" "mission_app_ami" {
+  name              = "Amazon Linux 2 Image"
+  description       = "A copy of ${data.aws_ami.linux.image_id} - ${data.aws_ami.linux.description}"
+  source_ami_id     = data.aws_ami.linux.image_id
+  source_ami_region = data.aws_region.current.name
+
+  tags = {
+    Name               = "${var.namespace}-ami"
+    Description        = data.aws_ami.linux.description
+    "Creation Date"    = data.aws_ami.linux.creation_date
+    "Deprecation Time" = data.aws_ami.linux.deprecation_time
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "mission_app" {
+  name               = "${var.namespace}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  subnets            = values(aws_subnet.private)[*].id
+
+  tags = {
+    Name = "${var.namespace}-lb"
+  }
+
+  security_groups = [aws_security_group.app.id]
+}
